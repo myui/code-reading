@@ -711,32 +711,432 @@ app.invoke({"value": "a"})
 
 ### チェックポイントシステムの概要
 
-LangGraphの状態永続化は階層的なチェックポイントシステムにより実現されています。これにより、実行の任意の時点で状態を保存し、完全に復元することが可能です。
+LangGraphの状態永続化は階層的なチェックポイントシステムにより実現されています。複数の永続化媒体をサポートし、開発から本番環境まで幅広いニーズに対応します。
 
 ```mermaid
 graph TB
     subgraph "永続化レイヤー"
-        A[BaseCheckpointSaver] --> B[MemorySaver]
+        A[BaseCheckpointSaver] --> B[InMemorySaver]
         A --> C[PostgresSaver]
         A --> D[SQLiteSaver]
+        A --> E[Future: RedisSaver]
     end
     
     subgraph "状態管理"
-        E[Checkpoint] --> F[channel_values]
-        E --> G[channel_versions]
-        E --> H[versions_seen]
-        E --> I[metadata]
+        F[Checkpoint] --> G[channel_values]
+        F --> H[channel_versions]
+        F --> I[versions_seen]
+        F --> J[metadata]
     end
     
     subgraph "シリアライゼーション"
-        J[JsonPlusSerializer] --> K[JSON互換オブジェクト]
-        J --> L[MessagePack]
-        J --> M[Pydanticモデル]
+        K[JsonPlusSerializer] --> L[JSON互換オブジェクト]
+        K --> M[MessagePack]
+        K --> N[Pydanticモデル]
+        K --> O[JSONB/PostgreSQL]
+        K --> P[BLOB/SQLite]
     end
     
-    E --> J
-    A --> E
+    subgraph "ストレージ媒体"
+        Q[メモリ] --> B
+        R[(PostgreSQL)] --> C
+        S[(SQLite)] --> D
+        T[(Redis)] -.-> E
+    end
+    
+    F --> K
+    A --> F
+    B --> Q
+    C --> R
+    D --> S
+    E -.-> T
+    
+    style C fill:#e8f5e8
+    style R fill:#e8f5e8
+    style E fill:#f0f0f0
+    style T fill:#f0f0f0
 ```
+
+### 永続化実装の詳細比較
+
+#### 1. **InMemorySaver** - 開発・テスト用
+
+**場所**: `libs/checkpoint/langgraph/checkpoint/memory/__init__.py`
+
+**データ構造**:
+```python
+class InMemorySaver:
+    # メイン記憶域: thread_id → checkpoint_ns → checkpoint_id → checkpoint
+    storage: defaultdict[str, dict[str, dict[str, tuple[str, bytes]]]]
+    
+    # 書き込み追跡: (thread_id, ns, checkpoint_id) → writes
+    writes: defaultdict[tuple[str, str, str], dict[tuple[str, int], tuple]]
+    
+    # Blob記憶域: 大きなチャネル値の分離保存
+    blobs: dict[tuple[str, str, str, str | int | float], tuple[str, bytes]]
+```
+
+**キー構造**:
+```
+storage:
+├── thread_abc123/
+│   ├── default/
+│   │   ├── checkpoint_001: (type, serialized_data)
+│   │   └── checkpoint_002: (type, serialized_data)
+│   └── custom_ns/
+│       └── checkpoint_003: (type, serialized_data)
+
+writes:
+├── (thread_abc123, default, checkpoint_001)/
+│   ├── (task_id_1, 0): write_data
+│   └── (task_id_2, 0): write_data
+
+blobs:
+├── (thread_abc123, default, checkpoint_001, channel_name): (type, data)
+└── (thread_abc123, default, checkpoint_002, channel_name): (type, data)
+```
+
+**特徴**:
+- ✅ 高速読み書き
+- ✅ 開発・テストに最適
+- ❌ プロセス終了で全データ消失
+- ❌ 本番環境非推奨
+
+#### 2. **SQLiteSaver** - 軽量永続化
+
+**場所**: `libs/checkpoint-sqlite/langgraph/checkpoint/sqlite/__init__.py`
+
+**データベーススキーマ**:
+```sql
+-- メインチェックポイントテーブル
+CREATE TABLE IF NOT EXISTS checkpoints (
+    thread_id TEXT NOT NULL,                    -- スレッド識別子
+    checkpoint_ns TEXT NOT NULL DEFAULT '',     -- 名前空間
+    checkpoint_id TEXT NOT NULL,                -- チェックポイント識別子
+    parent_checkpoint_id TEXT,                  -- 親チェックポイント
+    type TEXT,                                  -- シリアライゼーションタイプ
+    checkpoint BLOB,                            -- チェックポイントデータ（BLOB）
+    metadata BLOB,                              -- メタデータ（BLOB）
+    PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id)
+);
+
+-- 保留中書き込みテーブル
+CREATE TABLE IF NOT EXISTS writes (
+    thread_id TEXT NOT NULL,
+    checkpoint_ns TEXT NOT NULL DEFAULT '',
+    checkpoint_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,                      -- タスク識別子
+    idx INTEGER NOT NULL,                       -- 書き込み順序
+    channel TEXT NOT NULL,                      -- 対象チャネル
+    type TEXT,                                  -- データタイプ
+    value BLOB,                                 -- 値（BLOB）
+    PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, idx)
+);
+
+-- パフォーマンス用インデックス
+CREATE INDEX IF NOT EXISTS checkpoints_thread_id_idx ON checkpoints(thread_id);
+CREATE INDEX IF NOT EXISTS writes_thread_id_idx ON writes(thread_id);
+```
+
+**設定例**:
+```python
+# ファイルベース
+with SqliteSaver.from_conn_string("checkpoints.sqlite") as saver:
+    app = graph.compile(checkpointer=saver)
+
+# インメモリ（テスト用）
+saver = SqliteSaver.from_conn_string(":memory:")
+
+# WALモード設定（並行性向上）
+conn = sqlite3.connect("checkpoints.sqlite", check_same_thread=False)
+conn.execute("PRAGMA journal_mode=WAL")
+saver = SqliteSaver(conn)
+```
+
+**クエリパターン**:
+```sql
+-- チェックポイント取得
+SELECT checkpoint, metadata, parent_checkpoint_id 
+FROM checkpoints 
+WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id = ?;
+
+-- チェックポイント履歴
+SELECT checkpoint_id, metadata 
+FROM checkpoints 
+WHERE thread_id = ? AND checkpoint_ns = ? 
+ORDER BY checkpoint_id DESC 
+LIMIT ?;
+
+-- 書き込み取得
+SELECT task_id, idx, channel, type, value 
+FROM writes 
+WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id = ?
+ORDER BY task_id, idx;
+```
+
+**特徴**:
+- ✅ 単一ファイル、簡単デプロイ
+- ✅ ACID特性保証
+- ✅ 軽量アプリケーションに最適
+- ⚠️ 書き込み並行性制限
+- ⚠️ 大規模システム非推奨
+
+#### 3. **PostgresSaver** - エンタープライズ級
+
+**場所**: `libs/checkpoint-postgres/langgraph/checkpoint/postgres/base.py`
+
+**高度なスキーマ設計**:
+```sql
+-- マイグレーション管理
+CREATE TABLE checkpoint_migrations (v INTEGER PRIMARY KEY);
+
+-- メインチェックポイント（JSONB使用）
+CREATE TABLE checkpoints (
+    thread_id TEXT NOT NULL,
+    checkpoint_ns TEXT NOT NULL DEFAULT '',
+    checkpoint_id TEXT NOT NULL,
+    parent_checkpoint_id TEXT,
+    type TEXT,
+    checkpoint JSONB NOT NULL,                  -- JSON構造として保存
+    metadata JSONB NOT NULL DEFAULT '{}',       -- 高速クエリ可能
+    PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id)
+);
+
+-- 大きなチャネル値の分離ストレージ
+CREATE TABLE checkpoint_blobs (
+    thread_id TEXT NOT NULL,
+    checkpoint_ns TEXT NOT NULL DEFAULT '',
+    channel TEXT NOT NULL,                      -- チャネル名
+    version TEXT NOT NULL,                      -- バージョン番号
+    type TEXT NOT NULL,                         -- データタイプ
+    blob BYTEA,                                 -- バイナリデータ
+    PRIMARY KEY (thread_id, checkpoint_ns, channel, version)
+);
+
+-- 保留中書き込み（拡張）
+CREATE TABLE checkpoint_writes (
+    thread_id TEXT NOT NULL,
+    checkpoint_ns TEXT NOT NULL DEFAULT '',
+    checkpoint_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    idx INTEGER NOT NULL,
+    channel TEXT NOT NULL,
+    type TEXT,
+    blob BYTEA NOT NULL,
+    task_path TEXT NOT NULL DEFAULT '',          -- タスクパス追跡
+    PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, idx)
+);
+
+-- 高性能インデックス
+CREATE INDEX CONCURRENTLY checkpoints_thread_id_idx ON checkpoints(thread_id);
+CREATE INDEX CONCURRENTLY checkpoints_metadata_idx ON checkpoints USING GIN(metadata);
+CREATE INDEX CONCURRENTLY checkpoint_blobs_channel_idx ON checkpoint_blobs(thread_id, checkpoint_ns, channel);
+```
+
+**複雑なクエリ例**:
+```sql
+-- JSONB演算子を使用した高度なクエリ
+SELECT c.checkpoint_id, c.metadata, c.checkpoint
+FROM checkpoints c
+WHERE c.thread_id = $1 
+  AND c.checkpoint_ns = $2
+  AND c.metadata @> '{"step": 10}'              -- JSON演算子
+ORDER BY c.checkpoint_id DESC;
+
+-- Blob結合を含む完全なチェックポイント復元
+WITH checkpoint_data AS (
+    SELECT 
+        c.checkpoint,
+        COALESCE(
+            jsonb_object_agg(b.channel, jsonb_build_object('type', b.type, 'data', b.blob))
+            FILTER (WHERE b.blob IS NOT NULL), 
+            '{}'::jsonb
+        ) as blobs
+    FROM checkpoints c
+    LEFT JOIN checkpoint_blobs b ON (
+        c.thread_id = b.thread_id AND 
+        c.checkpoint_ns = b.checkpoint_ns
+    )
+    WHERE c.thread_id = $1 AND c.checkpoint_id = $2
+    GROUP BY c.checkpoint
+)
+SELECT checkpoint || jsonb_build_object('channel_values', blobs) as full_checkpoint
+FROM checkpoint_data;
+```
+
+**設定と接続管理**:
+```python
+# 接続文字列から
+with PostgresSaver.from_conn_string(
+    "postgresql://user:pass@localhost:5432/langgraph",
+    pipeline=True  # バッチ処理用パイプライン
+) as saver:
+    saver.setup()  # 初回セットアップ
+    app = graph.compile(checkpointer=saver)
+
+# 接続プール使用
+from psycopg_pool import ConnectionPool
+pool = ConnectionPool(
+    "postgresql://user:pass@localhost:5432/langgraph",
+    min_size=5, max_size=20
+)
+saver = PostgresSaver(pool)
+
+# 高度な設定
+saver = PostgresSaver.from_conn_string(
+    conninfo="postgresql://...",
+    pipeline=True,              # パイプライン処理
+    serde=CustomSerializer(),   # カスタムシリアライザー
+)
+```
+
+**マイグレーション例**:
+```python
+# PostgresSaver.setup()内部で実行される
+async def _amigrate(self) -> None:
+    async with self.pool.connection() as conn:
+        async with conn.cursor() as cur:
+            # 現在のバージョン確認
+            await cur.execute("SELECT v FROM checkpoint_migrations ORDER BY v DESC LIMIT 1")
+            version = (await cur.fetchone() or [0])[0]
+            
+            # 必要に応じてマイグレーション実行
+            if version < 1:
+                await cur.execute("""
+                    CREATE TABLE IF NOT EXISTS checkpoints (
+                        thread_id TEXT NOT NULL,
+                        checkpoint_ns TEXT NOT NULL DEFAULT '',
+                        -- ...
+                    )
+                """)
+            
+            if version < 2:
+                await cur.execute("ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'")
+            
+            # バージョン更新
+            await cur.execute("INSERT INTO checkpoint_migrations (v) VALUES (%s)", (LATEST_VERSION,))
+```
+
+**特徴**:
+- ✅ 本番環境対応
+- ✅ 高い並行性
+- ✅ JSONB高速クエリ
+- ✅ マイグレーション管理
+- ✅ Blob分離で最適化
+- ✅ 接続プール対応
+- ⚠️ PostgreSQL必須
+
+#### 4. **Redis実装** - 将来実装
+
+**現状**: コアには未実装、サードパーティまたは将来機能として言及
+
+**想定される実装**:
+```python
+# 想定されるRedis実装パターン
+class RedisSaver(BaseCheckpointSaver):
+    def __init__(self, redis_client: Redis):
+        self.redis = redis_client
+    
+    def put(self, config, checkpoint, metadata, new_versions):
+        # ハッシュベース保存
+        key = f"checkpoint:{config['thread_id']}:{config['checkpoint_ns']}:{checkpoint['id']}"
+        pipe = self.redis.pipeline()
+        pipe.hset(key, {
+            "checkpoint": self.serde.dumps_typed(checkpoint)[1],
+            "metadata": json.dumps(metadata),
+            "type": self.serde.dumps_typed(checkpoint)[0]
+        })
+        pipe.expire(key, ttl)  # TTL設定
+        pipe.execute()
+```
+
+### データシリアライゼーション戦略
+
+#### JsonPlusSerializer の詳細
+
+```python
+class JsonPlusSerializer(Serializer[Any]):
+    def dumps_typed(self, obj: Any) -> tuple[str, bytes]:
+        """型情報付きシリアライゼーション"""
+        if isinstance(obj, dict) and all(isinstance(k, str) for k in obj.keys()):
+            # JSON互換の場合
+            return "json", json.dumps(obj, ensure_ascii=False).encode()
+        else:
+            # 複雑なオブジェクトはmsgpack
+            return "msgpack", msgpack.packb(obj, default=_default, strict_types=True)
+    
+    def loads_typed(self, type_: str, data: bytes) -> Any:
+        """型情報を使用した復元"""
+        if type_ == "json":
+            return json.loads(data.decode())
+        elif type_ == "msgpack":
+            return msgpack.unpackb(data, object_hook=_object_hook, strict_map_key=False)
+        else:
+            raise ValueError(f"Unknown type: {type_}")
+```
+
+#### 特別な型の処理
+
+```python
+def _default(obj):
+    """msgpack用のエンコーダー"""
+    if isinstance(obj, datetime):
+        return {"__datetime__": obj.isoformat()}
+    elif isinstance(obj, BaseModel):  # Pydantic
+        return {"__pydantic__": obj.__class__.__module__ + "." + obj.__class__.__name__, 
+                "data": obj.model_dump()}
+    elif dataclasses.is_dataclass(obj):
+        return {"__dataclass__": obj.__class__.__module__ + "." + obj.__class__.__name__,
+                "data": dataclasses.asdict(obj)}
+    # ... その他の型
+    raise TypeError(f"Object of type {type(obj)} is not serializable")
+
+def _object_hook(obj):
+    """msgpack用のデコーダー"""
+    if "__datetime__" in obj:
+        return datetime.fromisoformat(obj["__datetime__"])
+    elif "__pydantic__" in obj:
+        cls = _import_class(obj["__pydantic__"])
+        return cls(**obj["data"])
+    # ... その他の型の復元
+    return obj
+```
+
+### 本番環境での選択指針
+
+#### 使用ケース別推奨
+
+```mermaid
+flowchart TD
+    A[永続化媒体選択] --> B{アプリケーション規模}
+    
+    B -->|個人・小規模| C[SQLiteSaver]
+    B -->|中規模・チーム| D[PostgresSaver]
+    B -->|大規模・エンタープライズ| E[PostgresSaver + 接続プール]
+    B -->|開発・テスト| F[InMemorySaver]
+    
+    C --> C1[単一ファイル<br/>簡単デプロイ<br/>軽量運用]
+    D --> D1[トランザクション保証<br/>高度なクエリ<br/>マイグレーション管理]
+    E --> E1[高可用性<br/>水平スケーリング<br/>レプリケーション]
+    F --> F1[高速開発<br/>テスト実行<br/>CI/CD統合]
+    
+    style C fill:#e1f5fe
+    style D fill:#e8f5e8
+    style E fill:#e8f5e8
+    style F fill:#fff3e0
+```
+
+#### 性能比較
+
+| 特性 | InMemory | SQLite | PostgreSQL |
+|------|----------|---------|------------|
+| **読み取り性能** | ★★★★★ | ★★★★☆ | ★★★★☆ |
+| **書き込み性能** | ★★★★★ | ★★★☆☆ | ★★★★☆ |
+| **並行性** | ★★☆☆☆ | ★★☆☆☆ | ★★★★★ |
+| **永続性** | ☆☆☆☆☆ | ★★★★★ | ★★★★★ |
+| **スケーラビリティ** | ★☆☆☆☆ | ★★☆☆☆ | ★★★★★ |
+| **運用コスト** | ★★★★★ | ★★★★☆ | ★★☆☆☆ |
+| **機能豊富さ** | ★★☆☆☆ | ★★★☆☆ | ★★★★★ |
 
 ### チェックポイントの作成タイミングと詳細プロセス
 
