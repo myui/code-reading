@@ -247,3 +247,202 @@ Trigger  →  Creation      → Enqueue  →  Execution → Persistence
 5. **水平スケーラビリティ**: 複数のWorkflowExecutorとAgentインスタンスが並行動作
 
 この設計により、Digdagは高可用性と拡張性を持つワークフロー実行エンジンを実現しています。
+
+## ワークフロー登録シーケンス
+
+### 概要
+
+Digdagでは、.digファイルで定義されたワークフローが以下の段階を経て実行可能な形に変換されます：
+
+1. **プロジェクトロード**: .digファイルの発見と読み込み
+2. **ワークフローコンパイル**: 設定の解析とタスクDAGの構築
+3. **データベース保存**: ワークフロー定義の永続化
+4. **スケジュール設定**: 定期実行の設定
+5. **実行準備**: セッションと試行の作成
+
+### 主要コンポーネント
+
+- **ProjectArchiveLoader**: プロジェクトの読み込み
+- **WorkflowCompiler**: .dig設定のコンパイル
+- **ProjectService**: サーバーモードでのプロジェクト管理
+- **LocalSite**: ローカルモードでのワークフロー管理
+- **WorkflowExecutor**: ワークフローの実行制御
+
+### ワークフロー登録シーケンス図
+
+```mermaid
+sequenceDiagram
+    participant CLI as CLI/Client
+    participant PAL as ProjectArchiveLoader
+    participant WC as WorkflowCompiler
+    participant PS as ProjectService
+    participant DB as Database
+    participant WE as WorkflowExecutor
+    participant SCH as ScheduleExecutor
+
+    Note over CLI: ワークフロー登録の開始
+    CLI->>PAL: load(projectDir)
+    PAL->>PAL: scanDirectory()
+    PAL->>PAL: loadParameterizedFile(.dig)
+    PAL-->>CLI: ProjectArchive
+    
+    Note over CLI: ワークフローコンパイル
+    CLI->>WC: compile(name, config)
+    WC->>WC: validateConfig()
+    WC->>WC: buildTaskDAG()
+    WC->>WC: resolveTaskDependencies()
+    WC->>WC: processSpecialTasks(_error, _check, _retry)
+    WC-->>CLI: Workflow
+
+    Note over CLI: サーバーモード - プロジェクト登録
+    CLI->>PS: putProject(projectName, revision, archive)
+    PS->>PS: extractArchive()
+    PS->>PS: validateArchive()
+    
+    loop For each .dig file
+        PS->>WC: compile(workflowName, config)
+        WC-->>PS: WorkflowDefinition
+    end
+    
+    Note over PS: データベース保存
+    PS->>DB: BEGIN TRANSACTION
+    PS->>DB: INSERT INTO projects
+    PS->>DB: INSERT INTO revisions
+    PS->>DB: INSERT INTO workflow_configs
+    PS->>DB: INSERT INTO workflow_definitions
+    PS->>DB: INSERT INTO schedules
+    PS->>DB: COMMIT
+    DB-->>PS: Project/Revision IDs
+    
+    Note over PS: スケジュール設定
+    PS->>SCH: updateSchedules()
+    SCH->>DB: UPDATE schedules SET next_run_time
+    
+    Note over CLI: ローカルモード - 直接実行
+    alt Local execution
+        CLI->>WE: submitWorkflow(attempt)
+        WE->>WC: compile(workflow)
+        WC-->>WE: WorkflowTaskList
+        WE->>DB: putAndLockSession()
+        WE->>DB: storeTasks()
+        WE->>WE: executeWorkflow()
+    end
+    
+    Note over SCH: スケジュール実行
+    SCH->>DB: lockReadySchedules()
+    DB-->>SCH: Schedule
+    SCH->>WE: submitWorkflow(AttemptRequest)
+    WE->>WE: [Task execution sequence starts]
+```
+
+### 詳細な登録フロー
+
+#### 1. プロジェクトアーカイブの読み込み
+
+**ProjectArchiveLoader.load()の処理**：
+```java
+// プロジェクトディレクトリのスキャン
+Files.walk(projectDir)
+    .filter(path -> path.toString().endsWith(".dig"))
+    .forEach(this::loadWorkflowFile);
+
+// 各.digファイルの読み込み
+Config config = configLoader.loadParameterizedFile(digFile);
+WorkflowFile workflowFile = WorkflowFile.of(name, config);
+```
+
+**主要処理**：
+1. **ディレクトリスキャン**: `.dig`ファイルを再帰的に検索
+2. **設定読み込み**: `ConfigLoaderManager`でYAML/JSON解析
+3. **アーカイブ作成**: `ProjectArchive`オブジェクトの構築
+4. **メタデータ生成**: `ArchiveMetadata`の作成
+
+#### 2. ワークフローコンパイル
+
+**WorkflowCompiler.compile()の処理**：
+```java
+// タスクDAGの構築
+WorkflowTaskList tasks = compileTasks(config, Optional.empty());
+
+// 依存関係の解決
+resolveDependencies(tasks);
+
+// 特殊タスクの処理
+processErrorTasks(tasks);
+processCheckTasks(tasks);
+processRetryTasks(tasks);
+```
+
+**コンパイル手順**：
+1. **構文検証**: YAML/JSON構文の妥当性チェック
+2. **タスクDAG構築**: 親子関係と依存関係の解析
+3. **依存関係解決**: `_after`、`_parallel`の処理
+4. **特殊タスク処理**: `_error`、`_check`、`_retry`の展開
+5. **パラメータ継承**: `_export`、`_secrets`の伝播
+
+#### 3. データベーススキーマと保存
+
+**主要テーブル**：
+```sql
+-- プロジェクト管理
+projects (id, site_id, name, created_at)
+revisions (id, project_id, name, archive_type, archive_path, archive_md5, created_at)
+
+-- ワークフロー定義
+workflow_configs (id, project_id, config_digest, timezone, config)
+workflow_definitions (id, config_id, revision_id, name)
+
+-- スケジュール管理
+schedules (id, project_id, workflow_definition_id, next_run_time, next_schedule_time)
+```
+
+**保存処理**：
+1. **プロジェクト作成**: `ProjectControl.insertRevision()`
+2. **ワークフロー保存**: `insertWorkflowDefinitions()`
+3. **スケジュール設定**: `updateSchedules()`
+4. **トランザクション**: 全操作が原子的に実行
+
+#### 4. スケジュール設定と実行準備
+
+**スケジュール処理**：
+```java
+// スケジュール設定の更新
+scheduleStore.updateSchedules(projectId, workflowDefinitions);
+
+// 次回実行時刻の計算
+Instant nextRunTime = scheduleExecutor.getNextScheduleTime(schedule);
+```
+
+**実行準備**：
+1. **スケジュール作成**: 各ワークフローの実行スケジュールを設定
+2. **次回実行時刻**: cron式やinterval設定に基づく計算
+3. **タイムゾーン処理**: ワークフローごとのタイムゾーン設定
+4. **実行権限**: プロジェクト単位のアクセス制御
+
+#### 5. CLI コマンドとの連携
+
+**Push コマンド (サーバーモード)**：
+```bash
+digdag push myproject --revision 1.0.0
+```
+1. **アーカイブ作成**: `Archiver.createArchive()`でtarball生成
+2. **クライアント送信**: `DigdagClient.putProjectRevision()`
+3. **サーバー処理**: `ProjectResource.putProject()`で受信・処理
+
+**Run コマンド (ローカルモード)**：
+```bash
+digdag run workflow.dig
+```
+1. **プロジェクト読み込み**: `Arguments.loadProject()`
+2. **ローカル保存**: `LocalSite.storeLocalWorkflowsWithoutSchedule()`
+3. **即座実行**: `WorkflowExecutor.submitWorkflow()`
+
+### 重要な設計パターン
+
+1. **段階的処理**: ファイル読み込み → コンパイル → 保存 → 実行の明確な分離
+2. **トランザクション管理**: データベース操作の原子性保証
+3. **モード分離**: サーバーモードとローカルモードの処理分岐
+4. **依存関係解決**: 複雑なタスクDAGの正確な構築
+5. **エラーハンドリング**: 各段階での適切なエラー処理と報告
+
+この登録シーケンスにより、Digdagは複雑なワークフロー定義を効率的に管理・実行できるアーキテクチャを提供しています。
